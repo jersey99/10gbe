@@ -8,22 +8,21 @@ from migen.genlib.misc import WaitTimer
 
 from litex.soc.cores.freqmeter import FreqMeter
 
-from litex_boards.platforms import kc705
-from litex_boards.targets.kc705 import BaseSoC
+from litex_boards.targets.xilinx_kc705 import BaseSoC
 
 from litex.soc.cores.clock import *
 from litex.soc.integration.soc_core import *
-from litex.soc.integration.soc_sdram import soc_sdram_args, soc_sdram_argdict
 from litex.soc.integration.builder import builder_args, builder_argdict, Builder
 from litex.soc.cores import uart
 from litex.soc.interconnect import wishbone
+from litex.soc.interconnect.csr import *
 
-from liteeth.phy.usrgmii import LiteEthPHYRGMII
 from liteeth.phy.xgmii import LiteEthPHYXGMII
 from liteeth.core import LiteEthUDPIPCore
 from liteeth.frontend.etherbone import LiteEthEtherbone
 from liteeth.common import convert_ip
 
+from litex_boards.platforms.xilinx_kc705 import Platform
 
 class XilinxXGMII(Module, AutoCSR):
     """
@@ -175,15 +174,54 @@ class XilinxXGMII(Module, AutoCSR):
 
 class TenGbeTestSoC(BaseSoC, AutoCSR):
     def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(with_led_chaser=False, **kwargs)
 
-        user_leds = [self.platform.request("user_led", i) for i in range(8)]
-        counter = Signal(27)
+        self.user_leds = user_leds = [self.platform.request("user_led", i) for i in range(8)]
+        self.counter = counter = Signal(27)
         self.sync += counter.eq(counter+1)
         self.comb += user_leds[0].eq(counter[26])
 
+        self.add_xgmii()
+
+        self.submodules.f_sample = FreqMeter(self.sys_clk_freq)
+        self.comb += self.f_sample.clk.eq(self.xgmii.cd_clkmgt.clk)
+        self.add_csr('f_sample')
+
+        # xg_counter = Signal(27)
+        # self.sync.xxv_eth_tx += xg_counter.eq(xg_counter+1)
+
+        counter_mgt = Signal(27)
+        self.sync.clkmgt += counter_mgt.eq(counter_mgt+1)
+        self.comb += user_leds[2].eq(counter_mgt[26])
+
+        # self.submodules.udp_core = LiteEthUDPIPCore(self.ethphy,
+        #                                         0x112233445566,
+        #                                         convert_ip("192.168.1.11"),
+        #                                         self.sys_clk_freq)
+        # self.add_csr("udp_core")
+        # self.submodules.etherbone = LiteEthEtherbone(self.udp_core.udp, 1234)
+        # self.add_wb_master(self.etherbone.wishbone.bus)
+
+
+        serial = self.platform.request("serial")
+        self.submodules.uart = uart.UARTWishboneBridge(
+            serial,
+            self.clk_freq,
+            baudrate=115200
+        )
+        self.add_wb_master(self.uart.wishbone)
+
+
+        # self.platform.add_ip("tengbe.tcl")
+        self.platform.add_ip("ip/ten_gig_eth_pcs_pma_0.xci")
+
+        self.platform.add_period_constraint(self.crg.cd_sys.clk, 1e9/self.sys_clk_freq)
+
+    def add_xgmii(self):
         self.submodules.xgmii = XilinxXGMII(self.crg.cd_sys, self.platform)
         self.add_csr('xgmii')
+        self.platform.add_period_constraint(self.xgmii.cd_clkmgt.clk, 1e9/156.25e6)
+        self.platform.add_false_path_constraints(self.crg.cd_sys.clk, self.xgmii.cd_clkmgt.clk)
 
         self.submodules.xgmiiphy = LiteEthPHYXGMII(self.xgmii.pads, self.xgmii.pads)
 
@@ -201,8 +239,8 @@ class TenGbeTestSoC(BaseSoC, AutoCSR):
         if always_xmit:
             send_pkt_counter_d = Signal()
             self.sync.clkmgt += [
-                send_pkt_counter_d.eq(counter[26]),
-                send_pkt.eq(send_pkt_counter_d ^ counter[26])
+                send_pkt_counter_d.eq(self.counter[26]),
+                send_pkt.eq(send_pkt_counter_d ^ self.counter[26])
             ]
 
         sink_counter = Signal(16)
@@ -219,14 +257,16 @@ class TenGbeTestSoC(BaseSoC, AutoCSR):
                 udp_port.sink.valid.eq(0),
                 udp_port.sink.last.eq(0)
             ),
-            If(sink_counter > 0,
-               udp_port.sink.valid.eq(1)
-            ),
+            udp_port.sink.valid.eq(sink_counter > 0),
+            udp_port.sink.last.eq(sink_counter == 1),
             If(sink_counter == 1,
-               udp_port.sink.last.eq(1)
+               udp_port.sink.last_be.eq(0x80)
+            ).Else(
+               udp_port.sink.last_be.eq(0x0)
             )
         ]
 
+        self.comb += self.user_leds[1].eq(udp_port.sink.valid)
         self.comb += [
             # param
             udp_port.sink.src_port.eq(3000),
@@ -240,39 +280,6 @@ class TenGbeTestSoC(BaseSoC, AutoCSR):
         ]
         self.add_csr("teng_udp_core")
 
-        self.submodules.f_sample = FreqMeter(self.sys_clk_freq)
-        self.comb += self.f_sample.clk.eq(self.xgmii.cd_clkmgt.clk)
-        self.add_csr('f_sample')
-
-        counter_mgt = Signal(27)
-        self.sync.clkmgt += counter_mgt.eq(counter_mgt+1)
-        self.comb += user_leds[2].eq(counter_mgt[26])
-
-        # xg_counter = Signal(27)
-        # self.sync.xxv_eth_tx += xg_counter.eq(xg_counter+1)
-        # self.comb += user_leds[1].eq(xg_counter[26])
-
-        self.submodules.udp_core = LiteEthUDPIPCore(self.ethphy,
-                                                0x112233445566,
-                                                convert_ip("192.168.1.11"),
-                                                self.sys_clk_freq)
-        self.add_csr("udp_core")
-        self.submodules.etherbone = LiteEthEtherbone(self.udp_core.udp, 1234)
-        self.add_wb_master(self.etherbone.wishbone.bus)
-
-        # self.platform.add_ip("tengbe.tcl")
-        self.platform.add_ip("ip/ten_gig_eth_pcs_pma_0.xci")
-
-        self.platform.add_period_constraint(self.crg.cd_sys.clk, 1e9/self.sys_clk_freq)
-        self.platform.add_period_constraint(self.ethphy.crg.cd_eth_rx.clk, 1e9/125e6)
-        self.platform.add_period_constraint(self.ethphy.crg.cd_eth_tx.clk, 1e9/125e6)
-
-        self.platform.add_false_path_constraints(
-            self.crg.cd_sys.clk,
-            self.ethphy.crg.cd_eth_rx.clk,
-            self.ethphy.crg.cd_eth_tx.clk
-        )
-
 
 class DevSoC(TenGbeTestSoC):
     def __init__(self, **kwargs):
@@ -283,30 +290,32 @@ class DevSoC(TenGbeTestSoC):
             self.udp_port.sink.ready,
             self.udp_port.sink.last,
             self.udp_port.sink.data,
-            self.xgmii.rx_ctl,
-            self.xgmii.rx_data,
-            self.xgmii.tx_ctl,
-            self.xgmii.tx_data,
-            self.xgmii.pma_status,
-            self.xgmii.tx_disable,
-            self.xgmii.qplllock  ,
-            self.xgmii.gtrxreset ,
-            self.xgmii.gttxreset ,
-            self.xgmii.txusrrdy  ,
-            self.xgmii.pcs_clear  ,
-            self.xgmii.pma_multi  ,
+            # self.xgmii.rx_ctl,
+            # self.xgmii.rx_data,
+            # self.xgmii.tx_ctl,
+            # self.xgmii.tx_data,
+            # self.xgmii.pma_status,
+            # self.xgmii.tx_disable,
+            # self.xgmii.qplllock  ,
+            # self.xgmii.gtrxreset ,
+            # self.xgmii.gttxreset ,
+            # self.xgmii.txusrrdy  ,
+            # self.xgmii.pcs_clear  ,
+            # self.xgmii.pma_multi  ,
             self.xgmiiphy.rx.source.valid,
             self.xgmiiphy.rx.source.data,
             self.xgmiiphy.tx.sink.valid,
             self.xgmiiphy.tx.sink.data,
-            self.teng_udp_core.mac.core.sink.valid,
-            self.teng_udp_core.mac.core.sink.data,
-            self.teng_udp_core.arp.rx.sink.valid,
-            self.teng_udp_core.arp.rx.sink.data,
-            self.teng_udp_core.arp.tx.source.valid,
-            self.teng_udp_core.arp.tx.source.data,
+            # self.teng_udp_core.mac.core.sink.valid,
+            # self.teng_udp_core.mac.core.sink.data,
+            # self.teng_udp_core.arp.rx.sink.valid,
+            # self.teng_udp_core.arp.rx.sink.data,
+            # self.teng_udp_core.arp.tx.source.valid,
+            # self.teng_udp_core.arp.tx.source.data,
         ]
+        print(self.xgmii.cd_clkmgt.clk)
         self.submodules.analyzer = LiteScopeAnalyzer(analyzer_signals, 1024,
+                                                     clock_domain="clkmgt",
                                                      csr_csv="analyzer.csv")
         self.add_csr("analyzer")
 
@@ -317,21 +326,21 @@ def main():
     parser = argparse.ArgumentParser(description="10GbE test setup on KC705")
     parser.add_argument("--build", action="store_true", help="Build bitstream")
     parser.add_argument("--load",  action="store_true", help="Load bitstream")
+    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
     builder_args(parser)
     soc_core_args(parser)
-    parser.add_argument("--with-ethernet", action="store_true", help="Enable Ethernet support")
     args = parser.parse_args()
     print(args)
 
-    soc = TenGbeTestSoC(sys_clk_freq=int(125e6), with_ethernet=args.with_ethernet, **soc_core_argdict(args))
     if args.build:
+        soc = DevSoC(sys_clk_freq=int(125e6), with_ethernet=args.with_ethernet, **soc_core_argdict(args))
         builder = Builder(soc, **builder_argdict(args))
         vns = builder.build(run=args.build)
         # soc.analyzer.do_exit(vns)
 
     if args.load:
-        prog = soc.platform.create_programmer()
-        prog.load_bitstream('build/kc705/gateware/kc705.bit')
+        prog = Platform().create_programmer()
+        prog.load_bitstream('build/xilinx_kc705/gateware/xilinx_kc705.bit')
 
 
 if __name__ == "__main__":

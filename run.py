@@ -17,6 +17,8 @@ def main(args):
     print(f'pcs status: {hex(wb.regs.xgmii_pcs_status.read())}')
     print('pcs reset: ', wb.regs.xgmii_pcs_config.write(1))
 
+    print(f'pcs status: {hex(wb.regs.xgmii_pcs_status.read())}')
+
     for i in range(1):
         print(wb.regs.f_sample_value.read()/1e6)
         time.sleep(1)
